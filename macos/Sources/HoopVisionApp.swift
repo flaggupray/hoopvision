@@ -1,7 +1,38 @@
 import SwiftUI
+import AppKit
+
+// MARK: - App Delegate
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        Task { @MainActor in
+            NSApp.appearance = NSAppearance(named: .aqua)
+        }
+    }
+
+    func applicationWillBecomeActive(_ notification: Notification) {
+        Task { @MainActor in
+            configureAllWindows()
+        }
+    }
+
+    @MainActor
+    private func configureAllWindows() {
+        for window in NSApp.windows {
+            window.titlebarAppearsTransparent = true
+            window.isOpaque = false
+            window.backgroundColor = NSColor(red: 0.95, green: 0.95, blue: 0.97, alpha: 1.0)
+            window.hasShadow = true
+            window.isMovableByWindowBackground = true
+        }
+    }
+}
+
+// MARK: - App
 
 @main
 struct HoopVisionApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var appState = AppState()
 
     var body: some Scene {
@@ -9,7 +40,10 @@ struct HoopVisionApp: App {
             ContentView()
                 .environmentObject(appState)
                 .frame(minWidth: 960, minHeight: 680)
-                .preferredColorScheme(.light)
+                .background(Color(white: 0.955))
+                .onAppear {
+                    configureCurrentWindow()
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1100, height: 780)
@@ -20,7 +54,24 @@ struct HoopVisionApp: App {
                 .environmentObject(appState)
         }
     }
+
+    private func configureCurrentWindow() {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            for window in NSApp.windows where window.title.contains("HoopVision")
+                                        || window.isKeyWindow
+                                        || window.isMainWindow {
+                window.titlebarAppearsTransparent = true
+                window.isOpaque = false
+                window.backgroundColor = NSColor(red: 0.95, green: 0.95, blue: 0.97, alpha: 1.0)
+                window.hasShadow = true
+                window.isMovableByWindowBackground = true
+            }
+        }
+    }
 }
+
+// MARK: - Settings
 
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState

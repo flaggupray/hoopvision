@@ -8,6 +8,7 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
     @Published var eventsFound: Int = 0
     @Published var framesProcessed: Int = 0
     @Published var error: String?
+    @Published var allOutput: String = ""
 
     private var process: Process?
     private var outputPipe: Pipe?
@@ -91,31 +92,53 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
         process?.arguments = args
         process?.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
 
+        var env = ProcessInfo.processInfo.environment
+        let existingPythonPath = env["PYTHONPATH"] ?? ""
+        env["PYTHONPATH"] = existingPythonPath.isEmpty ? projectRoot : "\(projectRoot):\(existingPythonPath)"
+        env["HOME"] = NSHomeDirectory()
+        env["USER"] = NSUserName()
+        env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\(env["PATH"] ?? "")"
+        process?.environment = env
+
         outputPipe = Pipe()
         errorPipe = Pipe()
         process?.standardOutput = outputPipe
         process?.standardError = errorPipe
 
-        outputPipe?.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            guard let self = self else { return }
+        let output = OutputCollector()
+
+        outputPipe?.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
             if let str = String(data: data, encoding: .utf8) {
+                output.addStdout(str)
                 DispatchQueue.main.async {
                     self.parseProgressOutput(str)
+                    self.allOutput = output.combined()
                 }
             }
         }
 
-        process?.terminationHandler = { [weak self] proc in
+        errorPipe?.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            if let str = String(data: data, encoding: .utf8) {
+                output.addStderr(str)
+                DispatchQueue.main.async {
+                    self.allOutput = output.combined()
+                }
+            }
+        }
+
+        process?.terminationHandler = { proc in
             DispatchQueue.main.async {
-                self?.isRunning = false
-                self?.progress = 1.0
-                self?.currentStep = "Complete"
+                self.isRunning = false
+                self.progress = 1.0
+                self.currentStep = "Complete"
+                let combined = output.combined()
+                self.allOutput = "STDOUT:\n" + output.stdout + "\n\nSTDERR:\n" + output.stderr
                 if proc.terminationStatus != 0 {
-                    let errData = self?.errorPipe?.fileHandleForReading.readDataToEndOfFile() ?? Data()
-                    let errStr = String(data: errData, encoding: .utf8) ?? "Unknown error"
-                    self?.error = errStr
+                    self.error = output.stderr.isEmpty ? "Process exited with code \(proc.terminationStatus)" : output.stderr
                 }
             }
         }
@@ -129,30 +152,71 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
     }
 
     private func parseProgressOutput(_ text: String) {
-        currentStep = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            currentStep = trimmed
+        }
 
         if text.contains("Frames analyzed") {
             if let match = text.range(of: #"\d+"#, options: .regularExpression) {
                 framesProcessed = Int(text[match]) ?? framesProcessed
             }
-            progress = min(progress + 0.15, 0.95)
+            progress = max(progress, 0.95)
         }
         if text.contains("Events detected") {
             if let match = text.range(of: #"\d+"#, options: .regularExpression) {
                 eventsFound = Int(text[match]) ?? eventsFound
             }
-            progress = min(progress + 0.2, 0.95)
+        }
+        if text.contains("Frame size") {
+            progress = 0.15
         }
         if text.contains("Analyzing") {
-            progress = 0.3
+            progress = 0.30
+        }
+        if text.contains("Progress:") {
+            if let match = text.range(of: #"\d+"#, options: .regularExpression) {
+                let f = Int(text[match]) ?? 0
+                framesProcessed = f
+                progress = 0.30 + Double(f) * 0.01
+            }
         }
         if text.contains("Done!") {
             progress = 1.0
+        }
+        if text.contains("Error:") || text.contains("error") {
+            // Don't overwrite error, just track it
         }
     }
 
     func cancel() {
         process?.terminate()
         isRunning = false
+    }
+}
+
+// MARK: - Output Collector (thread-safe)
+
+final class OutputCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var stdout = ""
+    private(set) var stderr = ""
+
+    func addStdout(_ s: String) {
+        lock.lock()
+        stdout += s
+        lock.unlock()
+    }
+
+    func addStderr(_ s: String) {
+        lock.lock()
+        stderr += s
+        lock.unlock()
+    }
+
+    func combined() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return stdout + stderr
     }
 }

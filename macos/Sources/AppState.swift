@@ -11,7 +11,7 @@ enum AppScreen {
 class AppState: ObservableObject {
     @Published var screen: AppScreen = .welcome
     @Published var enginePath: String = ""
-    @Published var defaultDevice: String = "auto"
+    @Published var defaultDevice: String = "cpu"
     @Published var sampleRate: Int = 6
     @Published var enableOCR: Bool = true
     @Published var enableClassifier: Bool = true

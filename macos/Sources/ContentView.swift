@@ -59,25 +59,31 @@ extension View {
 struct GlassBackground: View {
     var body: some View {
         ZStack {
-            Color(red: 0.95, green: 0.95, blue: 0.97)
+            Color(white: 0.955)
 
             Circle()
-                .fill(LinearGradient(
-                    colors: [.orange.opacity(0.12), .clear],
-                    startPoint: .topTrailing, endPoint: .bottomLeading
-                ))
-                .frame(width: 500, height: 500)
-                .offset(x: 200, y: -200)
-                .blur(radius: 80)
+                .fill(
+                    RadialGradient(
+                        colors: [.orange.opacity(0.15), .clear],
+                        center: .topTrailing,
+                        startRadius: 0, endRadius: 300
+                    )
+                )
+                .frame(width: 520, height: 520)
+                .offset(x: 200, y: -180)
+                .blur(radius: 60)
 
             Circle()
-                .fill(LinearGradient(
-                    colors: [.blue.opacity(0.10), .clear],
-                    startPoint: .bottomLeading, endPoint: .topTrailing
-                ))
-                .frame(width: 400, height: 400)
-                .offset(x: -180, y: 180)
-                .blur(radius: 80)
+                .fill(
+                    RadialGradient(
+                        colors: [.blue.opacity(0.10), .clear],
+                        center: .bottomLeading,
+                        startRadius: 0, endRadius: 280
+                    )
+                )
+                .frame(width: 420, height: 420)
+                .offset(x: -180, y: 160)
+                .blur(radius: 60)
         }
         .ignoresSafeArea()
     }

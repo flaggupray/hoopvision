@@ -83,6 +83,20 @@ struct AnalysisProgressView: View {
                 }
             }
 
+            // Debug output log
+            if !bridge.allOutput.isEmpty {
+                ScrollView {
+                    Text(bridge.allOutput)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                }
+                .frame(maxHeight: 200)
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+
             Spacer()
 
             // Cancel / Done buttons
