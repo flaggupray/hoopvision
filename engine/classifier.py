@@ -1,16 +1,17 @@
-"""Basketball action classifier.
+"""Basketball action classifier with multi-frame trajectory analysis.
 
-Event detection fuses 3 signals with a state machine:
-  1. YOLO ball detection proximity to estimated hoop zone
-  2. Optical flow trajectory points near hoop zone
-  3. Player shooting pose (wrists above head) near hoop zone
+Events are detected by analyzing ball/player trajectories over time,
+not single-frame snapshots.
 
-Shot tracking state machine:
-  idle -> ball_approaches_hoop -> shot_attempt -> ball_enters_hoop(make) / ball_bounces(miss) -> rebound_possible -> idle
+Shot detection: ball approaches hoop from distance, passes through hoop zone.
+Made/Missed: determined by whether ball passes through the hoop plane (y decreases
+  then increases = went through; y decreases then bounces back up = miss).
+Rebound: after a missed shot, players converge near hoop.
 """
 
 from dataclasses import dataclass, field
 from typing import Optional
+from collections import deque
 import numpy as np
 from engine.schema import Detection, Player, GameEvent, EventType
 from engine.pose import PoseResult
@@ -25,43 +26,70 @@ class ClassifierConfig:
     hoop_zone_radius: float = 150.0
     three_point_y_ratio: float = 0.40
     event_cooldown_seconds: float = 1.5
+    trajectory_length: int = 45
 
 
-class ScoreTracker:
-    """Tracks game score from events."""
+class TrajectoryBuffer:
+    """Stores ball positions over time for multi-frame analysis."""
 
-    def __init__(self):
-        self.home = 0
-        self.away = 0
-        self._last_shooter_team: Optional[str] = None
+    def __init__(self, maxlen: int = 45):
+        self._buf: deque[tuple[float, float, float, float]] = deque(maxlen=maxlen)
 
-    def update(self, event: GameEvent):
-        pts = 0
-        if event.event_type == EventType.THREE_POINTER_MADE:
-            pts = 3
-        elif event.event_type == EventType.TWO_POINTER_MADE:
-            pts = 2
-        elif event.event_type == EventType.FREE_THROW_MADE:
-            pts = 1
+    def add(self, x: float, y: float, ts: float, dist_to_hoop: float):
+        self._buf.append((x, y, ts, dist_to_hoop))
 
-        if pts == 0:
-            return
+    @property
+    def count(self) -> int: return len(self._buf)
 
-        # Simple heuristic: alternating teams for scoring
-        if self._last_shooter_team == "home":
-            self.away += pts
-            self._last_shooter_team = "away"
-        else:
-            self.home += pts
-            self._last_shooter_team = "home"
+    def clear(self): self._buf.clear()
 
-        event.score_before = f"{self.home - pts if self._last_shooter_team == 'home' else self.home}:{self.away - pts if self._last_shooter_team == 'away' else self.away}"
-        event.score_after = f"{self.home}:{self.away}"
+    def dist_trend(self, n: int = 10) -> float:
+        """Returns trend of distance to hoop: negative = approaching, positive = receding."""
+        if len(self._buf) < n:
+            return 0.0
+        recent = [p[3] for p in list(self._buf)[-n:]]
+        older = [p[3] for p in list(self._buf)[:n]]
+        return np.mean(recent) - np.mean(older)
 
-    def reset(self):
-        self.home = 0
-        self.away = 0
-        self._last_shooter_team = None
+    def min_dist_in_window(self, n: int = 30) -> float:
+        if not self._buf:
+            return float('inf')
+        return min(p[3] for p in list(self._buf)[-n:])
+
+    def y_trend(self, n: int = 8) -> float:
+        """Returns y trend: negative = moving upward, positive = moving downward."""
+        if len(self._buf) < n:
+            return 0.0
+        recent = [p[1] for p in list(self._buf)[-n:]]
+        older = [p[1] for p in list(self._buf)[:min(n, len(self._buf) // 2)]]
+        return np.mean(recent) - np.mean(older)
+
+    def y_range_in_window(self, n: int = 20) -> float:
+        if len(self._buf) < n:
+            return 0.0
+        ys = [p[1] for p in list(self._buf)[-n:]]
+        return max(ys) - min(ys)
+
+    def entered_zone_from_above(self, hoop_y: float, radius: float, n: int = 10) -> bool:
+        """Check if ball entered hoop zone from above (shot going through hoop)."""
+        if len(self._buf) < n:
+            return False
+        recent = list(self._buf)[-n:]
+        # Was it above the hoop zone, and now inside?
+        above = any(p[1] < hoop_y - radius * 0.3 and p[3] > radius for p in recent[:n // 2])
+        inside = any(p[1] >= hoop_y - radius * 0.5 and p[3] < radius * 0.5 for p in recent[-n // 2:])
+        return above and inside
+
+    def bounced_away(self, hoop_radius: float, n: int = 15) -> bool:
+        """Check if ball bounced away from hoop after approaching close."""
+        if len(self._buf) < n:
+            return False
+        recent = list(self._buf)[-n:]
+        mid = list(self._buf)[-n // 2:-n // 4]
+        end = list(self._buf)[-n // 4:]
+        min_mid = min(p[3] for p in mid) if mid else float('inf')
+        avg_end = np.mean([p[3] for p in end]) if end else 0
+        return min_mid < hoop_radius * 0.8 and avg_end > min_mid + 30
 
 
 class ActionClassifier:
@@ -70,10 +98,13 @@ class ActionClassifier:
         self._history: list[GameEvent] = []
         self._last_event_time: float = -999
         self._frame_count: int = 0
-        self._ball_was_near_hoop: bool = False
-        self._ball_entered_hoop: bool = False
-        self._shot_fired: bool = False
-        self._score = ScoreTracker()
+        self._trajectory = TrajectoryBuffer(self.config.trajectory_length)
+        self._phase: str = "idle"  # idle | approaching | shooting | post_shot
+        self._phase_frames: int = 0
+        self._shot_player_id: int = -1
+        self._home_score: int = 0
+        self._away_score: int = 0
+        self._scoring_team: int = 0
 
     @property
     def hoop_center(self) -> tuple[float, float]:
@@ -81,152 +112,175 @@ class ActionClassifier:
                 self.config.frame_height * self.config.hoop_y_ratio)
 
     def classify_frame(
-        self,
-        detections: list[Detection],
-        players: list[Player],
-        pose_results: dict[int, PoseResult],
-        flow_balls: list[dict],
+        self, detections: list[Detection], players: list[Player],
+        pose_results: dict[int, PoseResult], flow_balls: list[dict],
     ) -> list[GameEvent]:
         self._frame_count += 1
         if not detections:
+            self._trajectory.clear()
             return []
 
         events: list[GameEvent] = []
         balls = [d for d in detections if d.class_ == "ball"]
         persons = [d for d in detections if d.class_ == "person"]
         hoop_x, hoop_y = self.hoop_center
-        has_ball = len(balls) > 0
         ts = detections[0].timestamp
 
-        # --- Determine if ball is near hoop ---
-        ball_near_hoop = False
-        ball_in_hoop = False
-        ball_y = hoop_y
+        # ---- Update trajectory ----
+        if balls:
+            b = balls[-1]
+            bx, by = b.bbox.center
+            dist = np.sqrt((bx - hoop_x)**2 + (by - hoop_y)**2)
+            self._trajectory.add(bx, by, ts, dist)
+        elif flow_balls:
+            fb = flow_balls[-1]
+            dist = np.sqrt((fb["x"] - hoop_x)**2 + (fb["y"] - hoop_y)**2)
+            self._trajectory.add(fb["x"], fb["y"], ts, dist)
+        self._phase_frames += 1
 
-        if has_ball:
-            ball = balls[-1]
-            bx, by = ball.bbox.center
-            ball_y = by
-            dist = np.sqrt((bx - hoop_x) ** 2 + (by - hoop_y) ** 2)
-            ball_near_hoop = dist < self.config.hoop_zone_radius
-            ball_in_hoop = dist < 30  # very close = went through
+        # ---- Multi-frame trajectory analysis ----
+        dist_trend = self._trajectory.dist_trend(12)
+        min_dist = self._trajectory.min_dist_in_window(30)
+        y_trend = self._trajectory.y_trend(8)
+        approaching = dist_trend < -10 and min_dist < self.config.hoop_zone_radius * 2
+        very_close = min_dist < self.config.hoop_zone_radius * 0.5
+        near_hoop = min_dist < self.config.hoop_zone_radius
+        bounced = self._trajectory.bounced_away(self.config.hoop_zone_radius)
+        from_above = self._trajectory.entered_zone_from_above(hoop_y, self.config.hoop_zone_radius)
+        trajectory_ready = self._trajectory.count >= 8
 
-        # Flow ball check
-        flow_near = any(fb.get("near_hoop", False) for fb in flow_balls)
-
-        # Pose check: any player near hoop in shooting pose?
-        pose_shot = False
+        # Pose-assisted: player near hoop with shooting form
+        pose_near = False
+        pose_pid = -1
         for p in persons:
-            pcx, pcy = p.bbox.center
-            if np.sqrt((pcx - hoop_x) ** 2 + (pcy - hoop_y) ** 2) < self.config.hoop_zone_radius:
-                if pose_results.get(p.track_id, PoseResult()).shooting_pose:
-                    pose_shot = True
+            d = np.sqrt((p.bbox.center[0] - hoop_x)**2 + (p.bbox.center[1] - hoop_y)**2)
+            if d < self.config.hoop_zone_radius:
+                pr = pose_results.get(p.track_id)
+                if pr and pr.shooting_pose:
+                    pose_near = True
+                    pose_pid = p.track_id
                     break
 
-        # --- State machine ---
-        shot_signal = ball_near_hoop or flow_near or pose_shot
+        # ---- Phase state machine ----
+        if self._phase == "idle":
+            if trajectory_ready and (approaching or pose_near):
+                self._phase = "approaching"
+                self._phase_frames = 0
+                self._shot_player_id = pose_pid if pose_near else (
+                    self._find_nearest_player(persons, hoop_x, hoop_y))
 
-        # SHOT: signal rises when previously not near hoop
-        if shot_signal and not self._ball_was_near_hoop and self._can_fire(ts):
-            self._shot_fired = True
-            ev = self._make_shot(ts, ball_y, balls, persons, players, pose_results)
-            if ev:
-                events.append(ev)
-
-        # MADE/MISSED: ball enters tight hoop zone or bounces away
-        if self._shot_fired and has_ball:
-            if ball_in_hoop and not self._ball_entered_hoop:
-                self._ball_entered_hoop = True
-            if not ball_near_hoop and self._ball_was_near_hoop:
-                # Ball left hoop zone without entering tight zone = miss
-                if not self._ball_entered_hoop and self._can_fire(ts):
-                    ev = self._make_miss(ts, ball_y, persons, players)
+        elif self._phase == "approaching":
+            if very_close or from_above:
+                self._phase = "shooting"
+                self._phase_frames = 0
+                if self._can_fire(ts):
+                    ev = self._emit_shot(ts, persons, players, hoop_y)
                     if ev:
                         events.append(ev)
-                        self._shot_fired = False
-                        self._ball_entered_hoop = False
+            elif self._phase_frames > 60:
+                self._phase = "idle"
 
-        # REBOUND: after shot, multiple players near hoop
-        if self._shot_fired and not shot_signal and len(persons) >= 2:
+        elif self._phase == "shooting":
+            if bounced:
+                if self._can_fire(ts):
+                    ev = self._emit_miss(ts, persons, players, hoop_y)
+                    if ev:
+                        events.append(ev)
+                self._phase = "post_shot"
+                self._phase_frames = 0
+            elif self._phase_frames > 30:
+                # No bounce detected - assume made
+                self._phase = "idle"
+                self._phase_frames = 0
+
+        elif self._phase == "post_shot":
+            # Rebound detection: players converge near hoop after miss
             near_count = sum(1 for p in persons if
-                             np.sqrt((p.bbox.center[0] - hoop_x) ** 2 +
-                                     (p.bbox.center[1] - hoop_y) ** 2) < self.config.hoop_zone_radius * 1.3)
+                             np.sqrt((p.bbox.center[0] - hoop_x)**2 +
+                                     (p.bbox.center[1] - hoop_y)**2) < self.config.hoop_zone_radius * 1.2)
             if near_count >= 2 and self._can_fire(ts):
-                ev = self._make_rebound(ts, persons, players)
+                ev = self._emit_rebound(ts, persons, players, hoop_x, hoop_y)
                 if ev:
                     events.append(ev)
-                    self._shot_fired = False
-                    self._ball_entered_hoop = False
+                self._phase = "idle"
+            elif self._phase_frames > 45:
+                self._phase = "idle"
 
-        self._ball_was_near_hoop = shot_signal
         return events
 
-    def _make_shot(self, ts: float, ball_y: float, balls: list[Detection],
-                   persons: list[Detection], players: list[Player],
-                   pose_results: dict[int, PoseResult]) -> Optional[GameEvent]:
+    def _find_nearest_player(self, persons: list[Detection], hx: float, hy: float) -> int:
+        if not persons:
+            return -1
+        return min(persons, key=lambda p: (p.bbox.center[0] - hx)**2 + (p.bbox.center[1] - hy)**2).track_id
+
+    def _emit_shot(self, ts: float, persons: list[Detection], players: list[Player],
+                   hoop_y: float) -> Optional[GameEvent]:
+        hoop_x, hoop_y2 = self.hoop_center
+        pid = self._shot_player_id if self._shot_player_id > 0 else self._find_nearest_player(persons, hoop_x, hoop_y2)
+        pl = next((p for p in players if p.track_id == pid), None)
+
+        min_dist = self._trajectory.min_dist_in_window(20)
+        ball_y = hoop_y - 50
+        if self._trajectory.count > 0:
+            ball_y = list(self._trajectory._buf)[-1][1]
+
         three_line = self.config.frame_height * self.config.three_point_y_ratio
         ev_type = EventType.THREE_POINTER_MADE if ball_y < three_line else EventType.TWO_POINTER_MADE
 
-        hoop_x, hoop_y = self.hoop_center
-        pid = -1
-        min_d = float('inf')
-        for p in persons:
-            d = np.sqrt((p.bbox.center[0] - hoop_x) ** 2 + (p.bbox.center[1] - hoop_y) ** 2)
-            if d < min_d:
-                min_d = d
-                pid = p.track_id
+        self._last_event_time = ts
+        ev = GameEvent(time_str=self._fmt(ts), quarter=self._qtr(ts),
+                       event_type=ev_type, player_track_id=pid,
+                       player_number=pl.jersey_number if pl else None,
+                       distance=round(min_dist / 10, 1) if min_dist < 9999 else 0.0)
+        self._update_score(ev)
+        self._history.append(ev)
+        return ev
 
+    def _emit_miss(self, ts: float, persons: list[Detection], players: list[Player],
+                   hoop_y: float) -> Optional[GameEvent]:
+        hoop_x, hoop_y2 = self.hoop_center
+        pid = self._shot_player_id if self._shot_player_id > 0 else self._find_nearest_player(persons, hoop_x, hoop_y2)
         pl = next((p for p in players if p.track_id == pid), None)
-        self._last_event_time = ts
-        ev = GameEvent(
-            time_str=self._fmt(ts), quarter=self._qtr(ts),
-            event_type=ev_type, player_track_id=pid,
-            player_number=pl.jersey_number if pl else None,
-            distance=round(min_d / 10, 1),
-        )
-        self._score.update(ev)
-        self._history.append(ev)
-        return ev
 
-    def _make_miss(self, ts: float, ball_y: float, persons: list[Detection],
-                   players: list[Player]) -> Optional[GameEvent]:
         three_line = self.config.frame_height * self.config.three_point_y_ratio
-
-        # Convert the made event to missed
-        if self._history:
-            last = self._history[-1]
-            if last.event_type.is_score():
-                if last.event_type == EventType.THREE_POINTER_MADE:
-                    last.event_type = EventType.THREE_POINTER_MISSED
-                elif last.event_type == EventType.TWO_POINTER_MADE:
-                    last.event_type = EventType.TWO_POINTER_MISSED
-                return None  # Modified existing, don't add new
-
+        ball_y = hoop_y - 50
+        if self._trajectory.count > 0:
+            ball_y = list(self._trajectory._buf)[-1][1]
         ev_type = EventType.THREE_POINTER_MISSED if ball_y < three_line else EventType.TWO_POINTER_MISSED
+
         self._last_event_time = ts
-        ev = GameEvent(time_str=self._fmt(ts), quarter=self._qtr(ts), event_type=ev_type,
-                       player_track_id=-1, distance=0.0)
+        ev = GameEvent(time_str=self._fmt(ts), quarter=self._qtr(ts),
+                       event_type=ev_type, player_track_id=pid,
+                       player_number=pl.jersey_number if pl else None,
+                       distance=0.0)
         self._history.append(ev)
         return ev
 
-    def _make_rebound(self, ts: float, persons: list[Detection],
-                      players: list[Player]) -> Optional[GameEvent]:
-        hoop_x, hoop_y = self.hoop_center
-        nearest = min(persons, key=lambda p:
-        (p.bbox.center[0] - hoop_x) ** 2 + (p.bbox.center[1] - hoop_y) ** 2)
+    def _emit_rebound(self, ts: float, persons: list[Detection], players: list[Player],
+                      hx: float, hy: float) -> Optional[GameEvent]:
+        nearest = min(persons, key=lambda p: (p.bbox.center[0] - hx)**2 + (p.bbox.center[1] - hy)**2)
         pl = next((p for p in players if p.track_id == nearest.track_id), None)
 
-        # Check if last shot was missed → offensive rebound more likely
-        last_missed = (self._history and self._history[-1].event_type.is_miss())
+        last_missed = bool(self._history and self._history[-1].event_type.is_miss())
         ev_type = EventType.OFFENSIVE_REBOUND if last_missed else EventType.DEFENSIVE_REBOUND
 
         self._last_event_time = ts
         ev = GameEvent(time_str=self._fmt(ts), quarter=self._qtr(ts),
                        event_type=ev_type, player_track_id=nearest.track_id,
-                       player_number=pl.jersey_number if pl else None,
-                       distance=0.0)
+                       player_number=pl.jersey_number if pl else None, distance=0.0)
         self._history.append(ev)
         return ev
+
+    def _update_score(self, ev: GameEvent):
+        pts = 3 if ev.event_type == EventType.THREE_POINTER_MADE else 2
+        if self._scoring_team == 0:
+            self._home_score += pts
+            self._scoring_team = 1
+        else:
+            self._away_score += pts
+            self._scoring_team = 0
+        ev.score_before = f"{self._home_score - pts if self._scoring_team == 0 else self._home_score}:{self._away_score - pts if self._scoring_team == 1 else self._away_score}"
+        ev.score_after = f"{self._home_score}:{self._away_score}"
 
     def _can_fire(self, ts: float) -> bool:
         return (ts - self._last_event_time) >= self.config.event_cooldown_seconds
@@ -248,7 +302,10 @@ class ActionClassifier:
         self._history = []
         self._last_event_time = -999
         self._frame_count = 0
-        self._ball_was_near_hoop = False
-        self._ball_entered_hoop = False
-        self._shot_fired = False
-        self._score.reset()
+        self._trajectory.clear()
+        self._phase = "idle"
+        self._phase_frames = 0
+        self._shot_player_id = -1
+        self._home_score = 0
+        self._away_score = 0
+        self._scoring_team = 0
