@@ -33,6 +33,7 @@ def main():
     run_parser.add_argument("--confidence", type=float, default=0.5)
     run_parser.add_argument("--no-ocr", action="store_true", help="Disable jersey number OCR")
     run_parser.add_argument("--no-classify", action="store_true", help="Disable action classification")
+    run_parser.add_argument("--no-pose", action="store_true", help="Disable pose estimation")
     run_parser.add_argument("--home", default="", help="Home team name")
     run_parser.add_argument("--away", default="", help="Away team name")
     run_parser.add_argument("--date", default="", help="Game date")
@@ -63,6 +64,7 @@ def _cmd_run(args):
         device=args.device,
         enable_ocr=not args.no_ocr,
         enable_classifier=not args.no_classify,
+        enable_pose=not args.no_pose,
         confidence_threshold=args.confidence,
     )
 

@@ -7,7 +7,7 @@ from engine.schema import Detection, BoundingBox
 class TestDetectorConfig:
     def test_defaults(self):
         config = DetectorConfig()
-        assert config.model_name == "yolo11n.pt"
+        assert config.model_name == "yolo11m.pt"
         assert config.confidence_threshold == 0.5
         assert config.classes == {0: "person", 32: "ball"}
 
