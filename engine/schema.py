@@ -107,6 +107,7 @@ class GameEvent(BaseModel):
     score_before: Optional[str] = None
     score_after: Optional[str] = None
     detail: Optional[str] = None
+    narrative: Optional[str] = None
 
     @property
     def time_seconds(self) -> float:

@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ metadata.home_team }} vs {{ metadata.away_team }} — 比赛进程</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@350;400;500;600;700;800&family=Noto+Serif+SC:wght@400;500;600;700&family=Noto+Sans+SC:wght@350;400;500;600;700&display=swap');
+  :root {
+    --bg: #F2F2F7; --card-bg: rgba(255,255,255,0.66); --border: rgba(0,0,0,0.06);
+    --text: #1A1A1A; --text-secondary: #5C5C5C; --text-muted: #8E8E93;
+    --accent: #FF5E1A; --blue: #0077ED; --green: #34C759; --purple: #AF52DE; --red: #D32F2F;
+    --radius-xl: 34px; --radius-md: 16px;
+  }
+  * { margin:0;padding:0;box-sizing:border-box }
+  body { font-family:'Inter','Noto Sans SC',sans-serif;background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased;padding:24px }
+  .container { max-width:800px;margin:0 auto }
+  .game-header {
+    background:var(--card-bg);backdrop-filter:blur(40px);-webkit-backdrop-filter:blur(40px);
+    border:1px solid var(--border);border-radius:var(--radius-xl);padding:36px 44px;margin-bottom:24px;
+    box-shadow:0 1px 3px rgba(0,0,0,0.02),0 12px 40px rgba(0,0,0,0.08)
+  }
+  .game-header h1 { font-family:'Noto Serif SC',serif;font-size:28px;font-weight:700;margin-bottom:12px }
+  .game-header .meta { font-size:13px;color:var(--text-muted);display:flex;gap:16px;flex-wrap:wrap }
+  .quarter-tabs { display:flex;gap:4px;margin-bottom:20px;background:rgba(255,255,255,0.35);backdrop-filter:blur(20px);border:1px solid var(--border);border-radius:14px;padding:4px }
+  .q-tab { flex:1;text-align:center;padding:10px;border-radius:10px;font-size:14px;font-weight:550;cursor:pointer;color:var(--text-muted);border:none;background:none;font-family:inherit }
+  .q-tab.active { background:white;color:var(--text);font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,0.06) }
+  .event-card {
+    display:flex;gap:14px;padding:14px 20px;margin-bottom:2px;border-radius:var(--radius-md);
+    background:rgba(255,255,255,0.45);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
+    border:1px solid var(--border);transition:all 0.2s ease
+  }
+  .event-card:hover { transform:translateX(4px);box-shadow:0 2px 12px rgba(0,0,0,0.06) }
+  .event-time { font-family:'SF Mono','JetBrains Mono',monospace;font-size:14px;font-weight:600;color:var(--accent);min-width:52px;padding-top:2px }
+  .event-dot { width:8px;height:8px;border-radius:50%;margin-top:7px;flex-shrink:0;box-shadow:0 0 0 3px rgba(255,94,26,0.15) }
+  .event-dot.shot { background:var(--accent) }
+  .event-dot.rebound { background:var(--blue);box-shadow:0 0 0 3px rgba(0,119,237,0.15) }
+  .event-dot.assist { background:var(--purple);box-shadow:0 0 0 3px rgba(175,82,222,0.15) }
+  .event-dot.defense { background:var(--red);box-shadow:0 0 0 3px rgba(211,47,47,0.15) }
+  .event-dot.other { background:var(--text-muted) }
+  .event-body { flex:1 }
+  .event-narrative { font-family:'Noto Serif SC',serif;font-size:15px;font-weight:550;line-height:1.6 }
+  .event-narrative .num { font-family:'Inter',sans-serif;font-weight:700;background:rgba(0,0,0,0.05);border-radius:5px;padding:1px 7px;margin:0 2px;font-size:13px }
+  .event-detail { font-size:12px;color:var(--text-muted);margin-top:4px }
+  .event-tag { font-size:11px;font-weight:600;padding:2px 10px;border-radius:6px;margin-left:8px }
+  .event-tag.hit { background:rgba(52,199,89,0.1);color:var(--green) }
+  .event-tag.miss { background:rgba(211,47,47,0.08);color:var(--red) }
+  .footer { text-align:center;padding:32px;color:var(--text-muted);font-size:12px }
+  @media(max-width:640px){.game-header{padding:24px 20px}.event-card{padding:12px 14px}}
+</style>
+</head>
+<body>
+<div class="container">
+
+<header class="game-header">
+  <h1>{{ metadata.home_team }} vs {{ metadata.away_team }}</h1>
+  <div class="meta">
+    {% if metadata.date %}<span>{{ metadata.date }}</span>{% endif %}
+    {% if metadata.arena %}<span>{{ metadata.arena }}</span>{% endif %}
+    <span>{{ events|length }} 个事件</span>
+  </div>
+</header>
+
+{% set quarters = events|groupby('quarter') %}
+{% for quarter, quarter_events in quarters %}
+<div style="margin-bottom:28px">
+  <div style="font-family:'Noto Serif SC',serif;font-size:18px;font-weight:600;margin-bottom:14px;padding-left:4px">
+    第{{ quarter }}节 · {{ quarter_events|length }} 个事件
+  </div>
+
+  {% for event in quarter_events %}
+  <div class="event-card">
+    <div class="event-time">{{ event.time_str }}</div>
+    <div class="event-dot {{ event.event_type.category() }}"></div>
+    <div class="event-body">
+      <div class="event-narrative">
+        <span class="num">#{{ event.player_number or '?' }}</span>
+        {{ event.narrative }}
+        {% if event.event_type.is_score() %}
+        <span class="event-tag hit">✓ 命中</span>
+        {% elif event.event_type.is_miss() %}
+        <span class="event-tag miss">✗ 偏出</span>
+        {% endif %}
+      </div>
+      <div class="event-detail">
+        {% if event.distance %}距离 {{ "%.1f"|format(event.distance) }}m · {% endif %}
+        {% if event.assist_number and event.assist_number != event.player_number %}助攻 #{{ event.assist_number }} · {% endif %}
+        比分 {{ event.score_after or '?' }}
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endfor %}
+
+<div class="footer">
+  Generated by HoopVision · {{ events|length }} events across {{ quarters|length }} quarters
+</div>
+
+</div>
+</body>
+</html>
