@@ -19,93 +19,114 @@ class DetectorConfig:
 
 
 class BallTracker:
-    """Optical-flow based ball tracker for catching fast-moving small basketballs."""
+    """Optical-flow tracker for fast-moving basketballs."""
 
-    def __init__(self):
+    def __init__(self, max_points: int = 20):
         self._prev_gray = None
-        self._track_points = []
-        self._track_ages = []
-        self._next_id = 0
+        self._points: list[tuple[float, float]] = []
+        self._ages: list[int] = []
+        self._max_points = max_points
+        self._frames_since_scan = 0
 
     def track(self, frame: np.ndarray, hoop_center: tuple[float, float],
               hoop_radius: float) -> list[dict]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        results = []
+        self._frames_since_scan += 1
+        results: list[dict] = []
 
-        if self._prev_gray is not None and self._track_points:
-            pts = np.array(self._track_points, dtype=np.float32).reshape(-1, 1, 2)
+        if self._prev_gray is not None and self._points:
+            pts = np.array(self._points, dtype=np.float32).reshape(-1, 1, 2)
             new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
                 self._prev_gray, gray, pts, None,
-                winSize=(21, 21), maxLevel=3,
+                winSize=(15, 15), maxLevel=3,
                 criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
             )
             if new_pts is not None:
-                new_track = []
-                new_ages = []
+                valid_pts: list[tuple[float, float]] = []
+                valid_ages: list[int] = []
                 for i, (pt, st) in enumerate(zip(new_pts, status)):
                     if st[0] == 0:
                         continue
                     x, y = pt.ravel()
-                    age = self._track_ages[i] + 1
-                    new_track.append((float(x), float(y)))
-                    new_ages.append(age)
-                    if age > 3:
+                    if not (0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]):
+                        continue
+                    age = self._ages[i] + 1
+                    valid_pts.append((float(x), float(y)))
+                    valid_ages.append(age)
+                    if age > 2:
                         dist = np.sqrt((x - hoop_center[0])**2 + (y - hoop_center[1])**2)
                         results.append({
-                            "x": float(x), "y": float(y),
-                            "age": age,
-                            "near_hoop": dist < hoop_radius * 1.8,
+                            "x": float(x), "y": float(y), "age": age,
+                            "near_hoop": dist < hoop_radius * 1.6,
                         })
-                self._track_points = new_track
-                self._track_ages = new_ages
+                self._points = valid_pts
+                self._ages = valid_ages
 
-        # Find new candidate ball points: small bright moving blobs
-        if len(self._track_points) < 30:
-            candidates = self._find_ball_candidates(gray)
+        # Periodic scan for new candidates using frame difference
+        if self._frames_since_scan >= 5:
+            self._frames_since_scan = 0
+            candidates = self._scan_candidates(self._prev_gray, gray, hoop_center)
             for cx, cy in candidates:
-                if len(self._track_points) >= 30:
+                if len(self._points) >= self._max_points:
                     break
-                too_close = any(
-                    np.sqrt((cx - px)**2 + (cy - py)**2) < 10
-                    for px, py in self._track_points[-10:]
-                ) if self._track_points else False
-                if not too_close:
-                    self._track_points.append((cx, cy))
-                    self._track_ages.append(0)
+                if not self._points or all(
+                        np.sqrt((cx - px)**2 + (cy - py)**2) > 15
+                        for px, py in self._points[-8:]):
+                    self._points.append((cx, cy))
+                    self._ages.append(0)
+
+        # Prune stale points (age > 60 frames = 4s at 15fps)
+        if len(self._points) > self._max_points * 1.5:
+            keep = [(p, a) for p, a in zip(self._points, self._ages) if a < 60]
+            if keep:
+                self._points, self._ages = zip(*keep)
+                self._points, self._ages = list(self._points), list(self._ages)
+            else:
+                self._points, self._ages = [], []
 
         self._prev_gray = gray
         return results
 
-    def _find_ball_candidates(self, gray: np.ndarray) -> list[tuple[float, float]]:
+    def _scan_candidates(self, prev_gray, gray, hoop_center) -> list[tuple[float, float]]:
+        """Find small fast-moving bright blobs using frame differencing."""
+        if prev_gray is None:
+            return []
         h, w = gray.shape
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        diff = cv2.absdiff(gray, prev_gray)
+        _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         candidates = []
-        cells = [(0, 0), (w//2, 0), (0, h//2), (w//2, h//2)]
-        for ox, oy in cells:
-            roi = blur[oy:oy+h//2, ox:ox+w//2]
-            if roi.size == 0:
-                continue
-            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(roi)
-            if max_val > 180:
-                cx = ox + max_loc[0]
-                cy = oy + max_loc[1]
-                candidates.append((float(cx), float(cy)))
-        return candidates[:5]
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if 5 < area < 200:
+                M = cv2.moments(cnt)
+                if M["m00"] > 0:
+                    cx = M["m10"] / M["m00"]
+                    cy = M["m01"] / M["m00"]
+                    dist = np.sqrt((cx - hoop_center[0])**2 + (cy - hoop_center[1])**2)
+                    if dist < hoop_center[1] * 3:
+                        candidates.append((float(cx), float(cy)))
+        candidates.sort(key=lambda c: c[1])
+        return candidates[:8]
 
     def reset(self):
         self._prev_gray = None
-        self._track_points = []
-        self._track_ages = []
+        self._points = []
+        self._ages = []
+        self._frames_since_scan = 0
 
 
 class Detector:
-    def __init__(self, config: DetectorConfig | None = None):
+    def __init__(self, config: DetectorConfig | None = None, model=None):
         self.config = config or DetectorConfig()
-        import os, sys
-        model_path = self._resolve_model_path(self.config.model_name)
-        print(f"[detector] Loading {model_path}...", file=sys.stderr, flush=True)
-        self.model = YOLO(model_path)
-        print(f"[detector] Model ready", file=sys.stderr, flush=True)
+        if model is not None:
+            self.model = model
+        else:
+            import os, sys
+            path = self._resolve_model_path(self.config.model_name)
+            print(f"[detector] Loading {os.path.basename(path)}...", file=sys.stderr, flush=True)
+            self.model = YOLO(path)
+            print(f"[detector] ready", file=sys.stderr, flush=True)
         self._next_track_id = 0
         self._track_cache: dict[int, int] = {}
         self._frame_count = 0
@@ -114,12 +135,12 @@ class Detector:
     @staticmethod
     def _resolve_model_path(name: str) -> str:
         import os
-        candidates = [os.path.join("/tmp", name), os.path.join("/Users/mac/hoopvision", name),
-                      os.path.join(os.path.expanduser("~"), ".cache", "ultralytics", "weights", name),
-                      os.path.join(os.getcwd(), name), name]
-        for c in candidates:
-            if os.path.exists(c):
-                return os.path.abspath(c)
+        for d in ["/Users/mac/hoopvision", "/tmp",
+                  os.path.expanduser("~/.cache/ultralytics/weights"),
+                  os.getcwd()]:
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                return os.path.abspath(p)
         return name
 
     def detect(self, frame: np.ndarray, frame_idx: int, timestamp: float) -> list[Detection]:
@@ -129,23 +150,19 @@ class Detector:
                 frame,
                 conf=min(self.config.confidence_threshold, self.config.ball_confidence_threshold),
                 iou=self.config.iou_threshold,
-                device="cpu",
-                persist=True,
+                device="cpu", persist=True,
                 classes=list(self.config.classes.keys()),
                 verbose=False,
             )
-        except Exception as e:
-            import sys
-            print(f"[detector error] {e}", file=sys.stderr, flush=True)
+        except Exception:
             return []
 
-        detections: list[Detection] = []
         if results[0].boxes is None:
-            return detections
+            return []
 
         boxes = results[0].boxes
-        person_count = 0
-        ball_count = 0
+        dets: list[Detection] = []
+        pc = bc = 0
         for i in range(len(boxes)):
             cls_id = int(boxes.cls[i].item())
             conf = float(boxes.conf[i].item())
@@ -155,29 +172,25 @@ class Detector:
             if cls_name == "person" and conf < self.config.confidence_threshold:
                 continue
             if cls_name == "person":
-                person_count += 1
+                pc += 1
             elif cls_name == "ball":
-                ball_count += 1
+                bc += 1
             xyxy = boxes.xyxy[i].cpu().numpy()
-            track_id_raw = int(boxes.id[i].item()) if boxes.id is not None else -1
-            if track_id_raw not in self._track_cache:
+            tid_raw = int(boxes.id[i].item()) if boxes.id is not None else -1
+            if tid_raw not in self._track_cache:
                 self._next_track_id += 1
-                self._track_cache[track_id_raw] = self._next_track_id
-            detections.append(Detection(
+                self._track_cache[tid_raw] = self._next_track_id
+            dets.append(Detection(
                 frame_idx=frame_idx, timestamp=timestamp,
                 bbox=BoundingBox(x1=float(xyxy[0]), y1=float(xyxy[1]),
                                  x2=float(xyxy[2]), y2=float(xyxy[3])),
-                class_=cls_name,
-                track_id=self._track_cache[track_id_raw],
-                confidence=conf,
-            ))
+                class_=cls_name, track_id=self._track_cache[tid_raw],
+                confidence=conf))
 
-        if self._frame_count % 30 == 0:
+        if self._frame_count % 15 == 0:
             import sys
-            print(f"[detector] frame {self._frame_count}: {person_count} persons, "
-                  f"{ball_count} balls", file=sys.stderr, flush=True)
-
-        return detections
+            print(f"[det] f{self._frame_count}: {pc}p {bc}b", file=sys.stderr, flush=True)
+        return dets
 
     def reset_tracking(self):
         self._next_track_id = 0
