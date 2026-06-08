@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import time
+import numpy as np
 from engine.decoder import VideoDecoder, DecoderConfig
 from engine.detector import Detector, DetectorConfig
 from engine.ocr import JerseyOCR, OCRConfig
